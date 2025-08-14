@@ -1,0 +1,669 @@
+---
+title: 'Capstone Project: 14/08 - 39382'
+output: html_document
+date: "2025-08-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# libraries 
+library(dplyr)
+library(readr)
+library(stringr)
+library(fixest)
+library(MatchIt)
+library(cobalt)
+library(ggplot2)
+library(modelsummary)
+```
+
+## Loading AHRF 2022 observations using AHRF 2023 edition 
+
+```{r}
+data_telehealth_hf  <- read_csv("AHRF 2023-2024 CSV/CSV Files by Categories/ahrf2024hf.csv")
+data_telehealth_pop <- read_csv("AHRF 2023-2024 CSV/CSV Files by Categories/ahrf2024pop.csv")
+data_telehealth_geo <- read_csv("AHRF 2023-2024 CSV/CSV Files by Categories/ahrf2024geo_Feb2025.csv")
+data_telehealth_UTL <- read_csv("AHRF 2023-2024 CSV/CSV Files by Categories/ahrf2024utl.csv")
+data_telehealth_hp  <- read_csv("AHRF 2023-2024 CSV/CSV Files by Categories/ahrf2024hp.csv")
+```
+
+Loading pre-pandemic data, data for the placebo test and broadband data
+```{r}
+# AHRF 2019 telehealths
+data_ahrf_2019 <- read_csv("AHRF 2020-2021 CSV/ahrf2021_Feb2025.csv")
+# AHRF 2018 telehealths 
+data_ahrf_2018 <- read_csv("AHRF 2019-2020 CSV/ahrf2020_Feb2025.csv")
+#broadband data 
+broadband_data <- read_csv("broadband_data_2019November.csv")
+
+```
+
+## Function to make matching counties easier through the FIPS code 
+
+```{r}
+pad_fips <- function(df) {
+  df %>%
+    mutate(fips_st_cnty = str_pad(as.character(fips_st_cnty), width = 5, pad = "0"))
+}
+```
+
+## Merging AHRF data 
+```{r}
+data_telehealth_pop <- pad_fips(data_telehealth_pop)
+data_telehealth_geo <- pad_fips(data_telehealth_geo)
+data_telehealth_hf  <- pad_fips(data_telehealth_hf)
+data_telehealth_UTL <- pad_fips(data_telehealth_UTL)
+data_telehealth_hp  <- pad_fips(data_telehealth_hp)
+
+merged_data_2022 <- data_telehealth_pop %>%
+  left_join(data_telehealth_geo, by = "fips_st_cnty") %>%
+  left_join(data_telehealth_hf,  by = "fips_st_cnty") %>%
+  left_join(data_telehealth_UTL, by = "fips_st_cnty") %>%
+  left_join(data_telehealth_hp,  by = "fips_st_cnty") %>%
+  rename(FIPS = fips_st_cnty)
+
+```
+
+
+## Broadband Data Processing 
+```{r}
+broadband_data <- broadband_data %>%
+  rename(
+    broadband_availability = `BROADBAND AVAILABILITY PER FCC`,
+    broadband_usage = `BROADBAND USAGE`
+  ) %>%
+  mutate(
+    FIPS = sprintf("%05d", `COUNTY ID`),
+    broadband_availability = as.numeric(broadband_availability),
+    broadband_usage = as.numeric(broadband_usage)
+  ) %>%
+  select(FIPS, broadband_availability, broadband_usage)
+```
+
+
+## Control Variables 
+```{r}
+census_2020_controls <- merged_data_2022 %>%
+  select(FIPS, popn_wh_pct_20, popn_hsp_pct_20, cens_rural_popn_20, 
+         cens_urban_popn_20, pers_noins_lt65_pct_20) %>%
+  mutate(
+    total_pop_2020 = cens_rural_popn_20 + cens_urban_popn_20,
+    rural_pct_2020 = ifelse(total_pop_2020 > 0, 
+                            cens_rural_popn_20 / total_pop_2020 * 100, 
+                            NA_real_)
+  ) %>%
+  select(FIPS, popn_wh_pct_20, popn_hsp_pct_20, rural_pct_2020, pers_noins_lt65_pct_20)
+
+```
+
+## Panelling the data 
+
+```{r}
+create_year_data <- function(ahrf_data, year, telehealth_var, fips_var, 
+                             pop_var, income_var, beds_var, phys_var) {
+  
+  # using FIPS coding to format the counties 
+  ahrf_data <- ahrf_data %>%
+    rename(fips_st_cnty = !!sym(fips_var)) %>%
+    mutate(fips_st_cnty = str_pad(as.character(fips_st_cnty), 5, pad = "0")) %>%
+    rename(FIPS = fips_st_cnty)
+  
+  # creating one consistent dataset 
+  year_data <- ahrf_data %>%
+    left_join(broadband_data, by = "FIPS") %>%
+    left_join(census_2020_controls, by = "FIPS") %>%
+    mutate(
+      # Treatment variable
+      broadband_pct = broadband_availability * 100,
+      
+      # telehealth variable 
+      telehealth = !!sym(telehealth_var),
+      
+      # control variables 
+      population = !!sym(pop_var),
+      median_income = !!sym(income_var),
+      hospital_beds_per_1000 = !!sym(beds_var) / !!sym(pop_var) * 1000,
+      physicians_per_1000 = !!sym(phys_var) / !!sym(pop_var) * 1000,
+      
+      # Demographics 
+      pct_white = popn_wh_pct_20,
+      pct_hispanic = popn_hsp_pct_20,
+      rural_pct = rural_pct_2020,
+      pct_uninsured = pers_noins_lt65_pct_20,
+      
+      # Time indicators
+      year = !!year,
+      post_covid = ifelse(year >= 2020, 1, 0),
+      post_2019 = ifelse(year >= 2019, 1, 0)
+    ) %>%
+    select(FIPS, telehealth, broadband_pct, broadband_availability, broadband_usage,
+           population, median_income, physicians_per_1000, hospital_beds_per_1000,
+           pct_white, pct_hispanic, rural_pct, pct_uninsured, 
+           year, post_covid, post_2019)
+  
+  return(year_data)
+}
+```
+
+Dividing the data sets to focus on Specifc telehealth variables 
+
+```{r}
+# The following creates the 2022 telehealth outcomes Dataset 
+
+telehealth_2022 <- merged_data_2022 %>%
+  left_join(broadband_data, by = "FIPS") %>%
+  mutate(
+    broadband_pct = broadband_availability * 100,
+    telehealth = stgh_tele_conslttn_ofc_vists_22,
+    population = popn_est_22,
+    median_income = medn_hhi_saipe_22,
+    physicians_per_1000 = phys_nf_prim_care_pc_exc_rsdt_22 / popn_est_22 * 1000,
+    hospital_beds_per_1000 = hosp_beds_22 / popn_est_22 * 1000,
+    pct_over_65 = popn_est_ge65_22 / popn_est_22 * 100,
+    pct_white = popn_wh_pct_20,
+    pct_hispanic = popn_hsp_pct_20,
+    rural_pct = ifelse((cens_rural_popn_20 + cens_urban_popn_20) > 0,
+                       cens_rural_popn_20 / (cens_rural_popn_20 + cens_urban_popn_20) * 100,
+                       NA_real_),
+    pct_uninsured = pers_noins_lt65_pct_20,
+    year = 2022,
+    post_covid = 1
+  ) %>%
+  select(FIPS, telehealth, broadband_pct, broadband_availability, broadband_usage,
+         population, median_income, physicians_per_1000, hospital_beds_per_1000,
+         pct_over_65, pct_white, pct_hispanic, rural_pct, pct_uninsured, 
+         year, post_covid)
+
+```
+
+
+## 2019 telehealth dataset. 
+The AHRF datasets have different variable name/coding but can still be matched 
+
+```{r}
+#creating the 2019 outcome dataset 
+telehealth_2019 <- create_year_data(
+  data_ahrf_2019, 2019, "f1557519", "f00002", 
+  "f1198419", "f1322619", "f0892119", "f1467519"
+) %>%
+  mutate(pct_over_65 = NA_real_)
+
+```
+
+
+## 2018 telehealth data for the parallel trends testing 
+
+```{r}
+# the 2018 outcomes 
+telehealth_2018 <- create_year_data(
+  data_ahrf_2018, 2018, "f1557518", "f00002",
+  "f1198418", "f1322618", "f0892118", "f1467518"
+) %>%
+  mutate(pct_over_65 = NA_real_)
+```
+
+
+## AHRF panel dataset
+
+```{r}
+did_data <- bind_rows(telehealth_2019, telehealth_2022)
+placebo_data <- bind_rows(telehealth_2018, telehealth_2019)
+
+# Clean data
+did_data_clean <- did_data %>%
+  filter(!is.na(telehealth), !is.na(broadband_pct))
+
+placebo_data_clean <- placebo_data %>%
+  filter(!is.na(telehealth), !is.na(broadband_pct))
+```
+
+## Cleaning the data 
+
+```{r}
+summary_stats <- did_data_clean %>%
+  group_by(year) %>%
+  summarise(
+    n = n(),
+    mean_telehealth = round(mean(telehealth, na.rm = TRUE), 3),
+    median_telehealth = round(median(telehealth, na.rm = TRUE), 3),
+    mean_broadband = round(mean(broadband_pct, na.rm = TRUE), 1),
+    .groups = 'drop'
+  )
+print(summary_stats)
+```
+
+
+## Matching Analysis 
+
+```{r}
+
+# Matching data used for 2019 to make sure it is pre-treatment to avoid bias 
+matching_data_2019 <- did_data_clean %>%
+  filter(year == 2019) %>%
+  mutate(
+    # Binary treatment for matching
+    high_broadband = ifelse(broadband_pct > 96, 1, 0),
+    
+    # Categorical variables for exact matching
+    population_tercile = ntile(population, 3),
+    rural_category = case_when(
+      rural_pct >= 70 ~ "Rural",
+      rural_pct <= 30 ~ "Urban", 
+      TRUE ~ "Mixed"
+    ),
+    
+    # Regional variables
+    state_code = substr(FIPS, 1, 2),
+    region = case_when(
+      state_code %in% c("09", "23", "25", "33", "44", "50", "34", "36", "42") ~ "Northeast",
+      state_code %in% c("17", "18", "19", "20", "26", "27", "29", "31", "38", "39", "46", "55") ~ "Midwest",
+      state_code %in% c("10", "11", "12", "13", "24", "37", "45", "51", "54", "01", "21", "28", "47", "05", "22", "40", "48") ~ "South",
+      state_code %in% c("04", "08", "16", "30", "32", "35", "49", "56", "02", "06", "15", "41", "53") ~ "West",
+      TRUE ~ "Other"
+    ),
+    
+    # Healthcare infrastructure categories
+    hospital_capacity = case_when(
+      hospital_beds_per_1000 >= 3 ~ "High",
+      hospital_beds_per_1000 <= 1 ~ "Low",
+      TRUE ~ "Medium"
+    ),
+    
+    physician_density = case_when(
+      physicians_per_1000 >= 1 ~ "High",
+      physicians_per_1000 <= 0.5 ~ "Low", 
+      TRUE ~ "Medium"
+    )
+  ) %>%
+  filter(complete.cases(select(., high_broadband, population, median_income, rural_pct, 
+                               pct_white, pct_hispanic, physicians_per_1000, hospital_beds_per_1000)))
+
+# Output treatment distribution table
+print(table(matching_data_2019$high_broadband))
+
+# Defining the strategies 
+matching_strategies <- list(
+  size_based = list(
+    formula = high_broadband ~ median_income + rural_pct + pct_white + pct_hispanic + 
+      physicians_per_1000 + hospital_beds_per_1000,
+    exact = ~population_tercile,
+    name = "Size-Based"
+  ),
+  
+  healthcare = list(
+    formula = high_broadband ~ log(population) + median_income + rural_pct +
+      pct_white + pct_hispanic,
+    exact = c("hospital_capacity", "physician_density"),
+    name = "Healthcare Infrastructure"
+  ),
+  
+  geographic = list(
+    formula = high_broadband ~ log(population) + median_income + rural_pct + 
+      pct_white + pct_hispanic + physicians_per_1000 + hospital_beds_per_1000,
+    exact = ~region,
+    name = "Geographic"
+  ),
+  
+  rural_category = list(
+    formula = high_broadband ~ log(population) + median_income + 
+      pct_white + pct_hispanic + physicians_per_1000 + hospital_beds_per_1000,
+    exact = ~rural_category,
+    name = "Rural-Category"
+  )
+)
+
+# Matching and DiD analysis
+run_enhanced_analysis <- function(strategy, data, panel_data, placebo_panel) {
+  
+  # Perform matching
+  match_result <- matchit(
+    formula = strategy$formula,
+    data = data,
+    method = "nearest",
+    exact = strategy$exact,
+    caliper = 0.2,
+    std.caliper = TRUE
+  )
+  
+  print(match_result)
+  
+  # balance
+  balance <- bal.tab(match_result, binary = "std")
+  print(balance)
+  
+  # Extract matched counties
+  matched_counties <- match.data(match_result)$FIPS
+  
+  # Creating matched panel data
+  matched_panel <- panel_data %>%
+    filter(FIPS %in% matched_counties)
+  
+  matched_placebo <- placebo_panel %>%
+    filter(FIPS %in% matched_counties)
+  
+  # Main DiD model
+  did_model <- feols(telehealth ~ broadband_pct * post_covid + 
+                       log(population + 1) + median_income + 
+                       physicians_per_1000 + hospital_beds_per_1000,
+                     data = matched_panel,
+                     cluster = ~FIPS)
+  
+  # Placebo test
+  placebo_model <- feols(telehealth ~ broadband_pct * post_2019 + 
+                           log(population + 1) + median_income + 
+                           physicians_per_1000 + hospital_beds_per_1000,
+                         data = matched_placebo,
+                         cluster = ~FIPS)
+  
+  # Extract results
+  did_coef <- coef(did_model)["broadband_pct:post_covid"]
+  did_se <- se(did_model)["broadband_pct:post_covid"]
+  did_pval <- pvalue(did_model)["broadband_pct:post_covid"]
+  
+  placebo_coef <- coef(placebo_model)["broadband_pct:post_2019"]
+  placebo_pval <- pvalue(placebo_model)["broadband_pct:post_2019"]
+  
+  # Returning results 
+  return(list(
+    method = strategy$name,
+    match_result = match_result,
+    did_model = did_model,
+    placebo_model = placebo_model,
+    matched_counties = matched_counties,
+    did_coef = did_coef,
+    did_se = did_se,
+    did_pval = did_pval,
+    placebo_coef = placebo_coef,
+    placebo_pval = placebo_pval,
+    n_counties = length(matched_counties),
+    n_obs = nrow(matched_panel),
+    placebo_passes = placebo_pval > 0.05
+  ))
+}
+
+# Run all matching strategies
+all_results <- list()
+
+for(strategy_name in names(matching_strategies)) {
+  strategy <- matching_strategies[[strategy_name]]
+  all_results[[strategy_name]] <- run_enhanced_analysis(
+    strategy, matching_data_2019, did_data_clean, placebo_data_clean
+  )
+}
+
+
+```
+
+Results 
+
+```{r}
+# Baseline comparisons for the broadband data 
+baseline_comparison <- matching_data_2019 %>%
+  group_by(high_broadband) %>%
+  summarise(
+    n = n(),
+    mean_telehealth = round(mean(telehealth, na.rm = TRUE), 3),
+    mean_rural = round(mean(rural_pct, na.rm = TRUE), 1), 
+    mean_income = round(mean(median_income, na.rm = TRUE), 0),
+    mean_physicians = round(mean(physicians_per_1000, na.rm = TRUE), 2),
+    mean_population = round(mean(population, na.rm = TRUE), 0),
+    .groups = 'drop'
+  ) %>%
+  mutate(broadband_group = ifelse(high_broadband == 1, "High (>96%)", "Low (≤96%)")) %>%
+  select(-high_broadband)
+
+print(baseline_comparison)
+
+# T-tests for statistical significance
+ttest_results <- matching_data_2019 %>%
+  summarise(
+    telehealth_p = t.test(telehealth ~ high_broadband)$p.value,
+    rural_p = t.test(rural_pct ~ high_broadband)$p.value,
+    income_p = t.test(median_income ~ high_broadband)$p.value,
+    pop_p = t.test(population ~ high_broadband)$p.value,
+    phys_p = t.test(physicians_per_1000 ~ high_broadband)$p.value
+  )
+
+print(ttest_results)
+
+```
+## Results 
+
+```{r}
+# Creating a results data frame
+results_summary <- do.call(rbind, lapply(all_results, function(x) {
+  data.frame(
+    Method = x$method,
+    DiD_Coefficient = x$did_coef,
+    Standard_Error = x$did_se,
+    DiD_PValue = x$did_pval,
+    Placebo_Coefficient = x$placebo_coef,
+    Placebo_PValue = x$placebo_pval,
+    N_Counties = x$n_counties,
+    N_Observations = x$n_obs,
+    Placebo_Passes = x$placebo_passes,
+    CI_Lower = x$did_coef - 1.96 * x$did_se,
+    CI_Upper = x$did_coef + 1.96 * x$did_se
+  )
+}))
+
+print(results_summary)
+
+# Summary
+successful_methods <- sum(results_summary$Placebo_Passes)
+
+if (successful_methods > 0) {
+  valid_results <- results_summary %>% filter(Placebo_Passes == TRUE)
+  
+  coef_range <- range(valid_results$DiD_Coefficient)
+  mean_coef <- mean(valid_results$DiD_Coefficient)
+  
+  # Preferred specification (best placebo test p-value)
+  preferred <- valid_results[which.max(valid_results$Placebo_PValue), ]
+  
+} else {
+  # No methods fully satisfy parallel trends assumption
+  # Results should be interpreted with caution
+}
+
+# Comparisons
+if (require(modelsummary, quietly = TRUE)) {
+  
+  model_list <- setNames(
+    lapply(all_results, function(x) x$did_model),
+    sapply(all_results, function(x) x$method)
+  )
+  
+  modelsummary(model_list, 
+               coef_map = c("broadband_pct:post_covid" = "DiD Effect"),
+               gof_map = c("nobs", "r.squared"),
+               title = "Enhanced Matched DiD Results",
+               stars = TRUE)
+}
+```
+
+
+
+
+## Visualisations: 
+
+```{r}
+
+# Forest plot of the main results DiD estimates
+p1 <- ggplot(results_summary, aes(x = Method, y = DiD_Coefficient, 
+                                  color = Placebo_Passes)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5, colour = "darkred") +
+  coord_flip() +
+  scale_color_manual(values = c("FALSE" = "red", "TRUE" = "darkblue"),
+                     name = "Placebo Test Passed") +
+  labs(title = "Difference-in-Differences Coefficients by Matching Strategy",
+       x = "Matching Strategy",
+       y = "DiD Coefficient") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    axis.title.x = element_text(face = "bold", size = 11),
+    axis.title.y = element_text(face = "bold", size = 11), 
+    plot.background = element_rect(colour = "black", fill = NA, linewidth = 0.7)
+  )
+
+# Placebo test results
+p2 <- ggplot(results_summary, aes(x = Method, y = Placebo_PValue)) +
+  geom_point(size = 4, aes(color = Placebo_Passes)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "darkred") +
+  coord_flip() +
+  scale_color_manual(values = c("FALSE" = "red", "TRUE" = "darkblue"),
+                     name = "Placebo Test Passed") +
+  labs(title = "Parallel Trends & Placebo Test Results by Matching Strategy",
+       x = "Matching Strategy", 
+       y = "Placebo Test P-Value") +
+  theme_minimal() +
+  theme(legend.position = "top") + 
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    axis.title.x = element_text(face = "bold", size = 11),
+    axis.title.y = element_text(face = "bold", size = 11), 
+    plot.background = element_rect(colour = "black", fill = NA, linewidth = 0.7)
+  )
+
+
+print(p1)
+print(p2)
+```
+
+
+## Trend visualisations 
+```{r}
+
+# Creating trends data with broadband groups
+trends_data <- did_data_clean %>%
+  mutate(
+    broadband_group = ifelse(broadband_pct > 96, "High Broadband (>96%)", "Low Broadband (≤96%)")
+  ) %>%
+  group_by(year, broadband_group) %>%
+  summarise(
+    mean_telehealth = mean(telehealth, na.rm = TRUE),
+    se_telehealth = sd(telehealth, na.rm = TRUE) / sqrt(n()),
+    n_counties = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    ci_lower = mean_telehealth - 1.96 * se_telehealth,
+    ci_upper = mean_telehealth + 1.96 * se_telehealth
+  )
+
+# 2018 data for pre-trends
+trends_2018 <- placebo_data_clean %>%
+  filter(year == 2018) %>%
+  mutate(
+    broadband_group = ifelse(broadband_pct > 96, "High Broadband (>96%)", "Low Broadband (≤96%)")
+  ) %>%
+  group_by(year, broadband_group) %>%
+  summarise(
+    mean_telehealth = mean(telehealth, na.rm = TRUE),
+    se_telehealth = sd(telehealth, na.rm = TRUE) / sqrt(n()),
+    n_counties = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    ci_lower = mean_telehealth - 1.96 * se_telehealth,
+    ci_upper = mean_telehealth + 1.96 * se_telehealth
+  )
+
+# Combining all the years
+full_trends <- bind_rows(trends_2018, trends_data)
+
+# Creating the trends plot
+trends_plot <- ggplot(full_trends, aes(x = year, y = mean_telehealth, 
+                                       color = broadband_group, shape = broadband_group)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.1, size = 0.8) +
+  geom_vline(xintercept = 2020, linetype = "dashed", color = "red", alpha = 0.7, size = 1) +
+  scale_color_manual(values = c("High Broadband (>96%)" = "#2E86AB", "Low Broadband (≤96%)" = "#A23B72")) +
+  scale_shape_manual(values = c("High Broadband (>96%)" = 16, "Low Broadband (≤96%)" = 17)) +
+  scale_x_continuous(breaks = c(2018, 2019, 2020, 2021, 2022), 
+                     labels = c("2018", "2019", "2020\n(COVID-19)", "2021", "2022")) +
+  labs(
+    title = "Telehealth Uptake Trends: High vs. Low Broadband Counties",
+    subtitle = "Parallel trends pre-COVID, divergence post-COVID",
+    x = "Year",
+    y = "Average Telehealth Offering Hospitals per County",
+    color = "Broadband Infrastructure Availability per county ",
+    shape = "Broadband Infrastructure Availability per county "  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    panel.grid.minor = element_blank(), 
+    plot.background = element_rect(colour = "black", fill = NA, linewidth = 0.7)
+  )
+
+print(trends_plot)
+ggsave("telehealth_trends_plot.png", trends_plot, width = 10, height = 6, dpi = 300)
+```
+
+
+## Spatial Visualisation
+```{r}
+
+# Prepare broadband coverage data
+broadband_map_data <- telehealth_2022 %>%
+  select(fips = FIPS, broadband_pct) %>%
+  filter(!is.na(broadband_pct)) %>%
+  mutate(
+    # Creatig categories
+    broadband_category = case_when(
+      broadband_pct >= 95 ~ "Very High (95-100%)",
+      broadband_pct >= 85 ~ "High (85-94%)",
+      broadband_pct >= 70 ~ "Medium (70-84%)",
+      broadband_pct >= 50 ~ "Low (50-69%)",
+      TRUE ~ "Very Low (<50%)"
+    ),
+    broadband_category = factor(broadband_category, 
+                                levels = c("Very Low (<50%)", "Low (50-69%)", 
+                                           "Medium (70-84%)", "High (85-94%)", 
+                                           "Very High (95-100%)"))
+  )
+
+# Create spatial plot
+spatial_plot_colorbrewer <- plot_usmap(data = broadband_map_data, 
+                                       values = "broadband_pct",
+                                       color = "white", 
+                                       linewidth = 0.08) +
+  scale_fill_gradientn(name = "Broadband\nAvailability\n(%)",
+                       colors = c("#ffffcc", "#a1dab4", "#41b6c4", "#2c7fb8", "#253494"),
+                       na.value = "gray90",
+                       breaks = c(0, 25, 50, 75, 100),
+                       labels = c("0%", "25%", "50%", "75%", "100%")) +
+  labs(
+    title = "Broadband Infrastructure Availability Across U.S. Counties (2019)",
+    caption = "Data: FCC Form 477 (2019)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "right",
+    plot.background = element_rect(colour = "black", fill = NA, linewidth = 0.7)
+  )
+
+print(spatial_plot_colorbrewer)
+```
+
+
+
+
+
+
+
+
