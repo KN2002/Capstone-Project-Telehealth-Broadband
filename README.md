@@ -1,7 +1,8 @@
 # Capstone-Project-Telehealth-Broadband
 This repository contains code and analysis for the MY498 Capstone Project.
-Title: The Digital Health Divide: Investigating the Role of Broadband Infrastructure in the Adoption of Telehealth in the United States 
-Candidate: 39382 
+Title: The Digital Health Divide: Investigating the Role of Broadband Infrastructure in the Adoption of Telehealth in the United States. 
+
+Candidate Number: 39382 
 
 The Rmarkdown file contains the data loading code, merging of datasets, pre-processing, propensity score matching analysis, the main difference-in-differences analysis code and supplementary visualisations code. 
 
